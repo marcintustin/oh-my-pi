@@ -38,6 +38,10 @@
 - Added a failed print-mode `/mcp reauth` (unknown server, refused operation, transport refusal) exiting 1 instead of 0, so `omp -p` automation does not treat a failed reauthorization as success ([#16046](https://github.com/can1357/oh-my-pi/pull/16046) by [@marcintustin](https://github.com/marcintustin))
 - Added resilience for ACP sessions whose client-declared MCP server fails to connect at startup (e.g. an expired client bearer): `session/new` still succeeds, the failure is reported as a session chunk once the client knows the session id, and `/mcp reauth` can recover the kept server entry in the same session ([#16046](https://github.com/can1357/oh-my-pi/pull/16046) by [@marcintustin](https://github.com/marcintustin))
 
+### Changed
+
+- Changed print-mode dispatch for operational builtins from CLI-authored input (`-p`/positional): `/compact`, `/handoff`, and `/retry` now run locally instead of prompting the model with the literal text, a failed one exits 1 instead of 0, a `/retry`-started turn's answer prints as this run's answer and gets the same pre-turn prep as a prompted turn (MCP readiness binding, the strict `OMP_MCP_REQUIRE_READY` gate, the working indicator, uncommitted text output) while holding the dispatch open until the retried turn streams, and the merged stdin/`@file` message is never dispatched — a slash payload arriving over a pipe always reaches the model as text; `/stats` stays undispatched because its in-process dashboard server cannot outlive the one-shot run ([#16387](https://github.com/can1357/oh-my-pi/pull/16387) by [@marcintustin](https://github.com/marcintustin))
+
 ### Fixed
 
 - Fixed `/mcp reauth` writing the fresh credential binding against the wrong source: the lookup now prefers the ACP session's own server over a colliding config-file name (and vice versa where they do not correspond), respects `mcp.enableProjectConfig: false` instead of resurrecting an opted-out project entry, and never lets a print/RPC file-manager entry shadow the real project/user config ([#16046](https://github.com/can1357/oh-my-pi/pull/16046) by [@marcintustin](https://github.com/marcintustin))

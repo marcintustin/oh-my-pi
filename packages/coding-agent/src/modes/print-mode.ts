@@ -251,6 +251,14 @@ async function runPrintModeCore(
 					return state;
 				}
 			: undefined,
+		// `/retry` only schedules its continuation (`session.retry()` posts a
+		// post-prompt task) and returns before the retried turn streams: hold
+		// the dispatch open until the session is idle — same pairing as the
+		// ACP runtime — or the next CLI-authored message would prompt ~1ms
+		// later and race the just-scheduled turn it should follow.
+		keepTurnOpenUntilIdle: async () => {
+			await session.waitForIdle();
+		},
 	});
 	// Whether a dispatched command consumed an input but failed (usage error,
 	// unknown server, refused operation). Print mode is automation surface: a
@@ -262,26 +270,61 @@ async function runPrintModeCore(
 	// persisted previous turn must not be reprinted or its old stop reason
 	// reused as this run's exit status.
 	let admittedAgentTurn = false;
-	// The one locally-dispatched print-mode command (this feature's scope).
-	const PRINT_REAUTH_COMMAND = /^\/mcp\s+reauth(?:\s|$)/;
+	// The print-mode-dispatched commands. Only commands whose runtime hooks
+	// are real in the headless runtime belong here: each runs a session API
+	// (`/mcp reauth` engine, `session.compact`, `session.handoff`,
+	// `session.retry`). Commands whose hooks would be stubs
+	// (`/reload-plugins` and friends) stay undispatched, and so does
+	// `/stats`: its dashboard server is in-process (`Bun.serve` inside this
+	// one-shot run), so launching it would open a browser tab that dies with
+	// the process and report a success the run cannot deliver. Keeping the
+	// process alive until the dashboard closes is a separate design
+	// decision; until then `/stats` keeps the historic prompt-the-literal
+	// behavior of every undispatched command.
+	const PRINT_DISPATCHED_COMMANDS = [
+		/^\/mcp\s+reauth(?:\s|$)/,
+		/^\/compact(?:\s|$)/,
+		/^\/handoff(?:\s|$)/,
+		/^\/retry(?:\s|$)/,
+	] as const;
+	// Dispatched commands that schedule a model turn themselves, outside
+	// `promptTurn` — today only `/retry`. They need the shared pre-turn prep
+	// (see `dispatchCliMessage`) before they execute.
+	const TURNSCHEDULING_COMMANDS = [/^\/retry(?:\s|$)/] as const;
 	/**
 	 * Dispatch a CLI-authored message as a local command, if it is one.
-	 *
 	 * Only CLI-authored input (`messages`, the positional/-p args) is ever
 	 * dispatched. The merged stdin/@file `initialMessage` is attacker-shaped
 	 * end to end — `curl … | omp "summarize"` must never run a slash payload
 	 * from the pipe as a command — so it always prompts the model as text.
-	 * `/mcp reauth` is the only dispatched command here; every other slash
-	 * input keeps the historic behavior of prompting the model literally.
-	 * Returns whether the message was consumed locally.
+	 * Commands outside the dispatched list keep the historic behavior of
+	 * prompting the model with the literal text. Returns whether the message
+	 * was consumed locally.
 	 */
 	const dispatchCliMessage = async (message: string): Promise<boolean> => {
-		if (!PRINT_REAUTH_COMMAND.test(message)) return false;
+		if (!PRINT_DISPATCHED_COMMANDS.some(pattern => pattern.test(message))) return false;
+		// `/retry` schedules its model turn outside `promptTurn`
+		// (`session.retry()` posts the continuation as a post-prompt task),
+		// so run `promptTurn`'s pre-turn prep BEFORE the command executes:
+		// the readiness binding (`waitForStartup` + `refreshMCPTools`), the
+		// strict `OMP_MCP_REQUIRE_READY` gate, the working indicator, and
+		// the uncommitted text output. Without it the retried turn would
+		// stream without the MCP tools turn one gets, strict automation
+		// would pass on a run it should fail, and turn recovery would treat
+		// buffered text as already committed.
+		if (TURNSCHEDULING_COMMANDS.some(pattern => pattern.test(message)) && !(await prepareAgentTurn())) {
+			// The strict gate refused the turn the command would schedule:
+			// reported, consumed without executing, and the run exits 1.
+			return true;
+		}
 		const result = await executeAcpBuiltinSlashCommand(message, builtinRuntimeFor());
-		// The allow-list only matches a registered command, so `false` (not a
+		// The allow-list only matches registered commands, so `false` (not a
 		// command) and a `{ prompt }` residual cannot occur; stay defensive.
 		if (result === false || "prompt" in result) return false;
 		if (result.failed) builtinFailed = true;
+		// A builtin that scheduled a real agent turn (`/retry`) admitted that
+		// turn: its answer (and stop reason) belong to this run.
+		if (result.agentInvoked) admittedAgentTurn = true;
 		// A recovery command may have repaired a server the strict gate
 		// failed on, so the gate re-evaluates before the next model turn.
 		return true;
@@ -367,15 +410,25 @@ async function runPrintModeCore(
 		process.stderr.write("Working...\n");
 		wroteTextWorkingIndicator = true;
 	};
-	/** Prompt the model with one input, gated on strict MCP readiness. */
-	const promptTurn = async (text: string, images?: PrintModeOptions["initialImages"]): Promise<void> => {
+	/**
+	 * Pre-turn prep shared by `promptTurn` and the dispatched
+	 * turn-scheduling commands (`/retry`): readiness binding, the strict
+	 * gate, the working indicator, and the uncommitted text output. Returns
+	 * whether the turn may run.
+	 */
+	const prepareAgentTurn = async (): Promise<boolean> => {
 		await ensureReadiness();
 		if (strict && unavailable.length > 0) {
 			reportStrictFailure();
-			return;
+			return false;
 		}
 		writeTextWorkingIndicator();
 		if (mode === "text") session.setTextOutputCommitted(false);
+		return true;
+	};
+	/** Prompt the model with one input, gated on strict MCP readiness. */
+	const promptTurn = async (text: string, images?: PrintModeOptions["initialImages"]): Promise<void> => {
+		if (!(await prepareAgentTurn())) return;
 		admittedAgentTurn = true;
 		await logger.time("print:prompt", () =>
 			images !== undefined ? session.prompt(text, { images }) : session.prompt(text),
