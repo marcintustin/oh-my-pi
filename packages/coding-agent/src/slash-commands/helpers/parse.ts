@@ -43,15 +43,31 @@ export function parseSlashCommand(text: string): ParsedSlashCommand | null {
  * tell local-only commands apart from work that starts a turn, so reporting
  * `agentInvoked: false` there would have them finalize the request while the
  * agent is still running.
+ *
+ * Pass `failed` when the command consumed the input but did not accomplish
+ * what was asked (usage error, unknown server, refused operation): interactive
+ * hosts ignore it, print mode turns it into a nonzero exit code so `omp -p`
+ * automation does not treat a failed builtin as success.
  */
-export function commandConsumed(options?: { agentInvoked?: boolean }): { consumed: true; agentInvoked?: boolean } {
-	return options?.agentInvoked ? { consumed: true, agentInvoked: true } : { consumed: true };
+export function commandConsumed(options?: { agentInvoked?: boolean; failed?: boolean }): {
+	consumed: true;
+	agentInvoked?: boolean;
+	failed?: boolean;
+} {
+	if (options?.agentInvoked) return { consumed: true, agentInvoked: true };
+	if (options?.failed) return { consumed: true, failed: true };
+	return { consumed: true };
 }
 
-/** Emit a usage/error message and consume the command. */
+/**
+ * Emit a usage/error message and consume the command as failed: the command
+ * consumed the input but did not accomplish what was asked. Interactive hosts
+ * ignore the marker; print mode turns it into a nonzero exit code so `omp -p`
+ * automation does not treat a failed builtin as success.
+ */
 export async function usage(text: string, runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
 	await runtime.output(text);
-	return commandConsumed();
+	return commandConsumed({ failed: true });
 }
 
 /** Split `<verb> <rest>` on the first whitespace; lowercases `verb`. */
